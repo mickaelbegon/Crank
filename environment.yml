@@ -1,0 +1,11 @@
+name: armcrank
+channels:
+  - conda-forge
+dependencies:
+  - python >=3.10
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - tk  # Tkinter for the GUI
+  - pip
