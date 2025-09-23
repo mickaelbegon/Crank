@@ -110,6 +110,9 @@ from tkinter import filedialog, ttk, messagebox
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
+
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
 
