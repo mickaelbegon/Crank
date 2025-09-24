@@ -1,23 +1,24 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.2
+Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.3
 =================================================
 
-What's new in v1.2
-------------------
-- GUI sliders to control:
-  * Non-zero speed threshold (in **degrees/s**) used for the active mask (default 2°/s).
-  * Tolerance around the active mean speed (in **±%**) for auto ROI detection (default 5%).
-- These controls affect both the auto ROI, the ROI visualization figure, and downstream analysis.
-
-Also includes (from v1.1):
-- ROI visualization + manual selection (SpanSelector).
-- Angles in degrees for XY plots when x-axis = crank angle.
-- Angle-normalized mean & std on a 0..359° grid (360 points) with plotting option "CrankAngle360°".
-
-See script for details and comments.
+New in v1.3
+-----------
+1) ROI logic:
+   - Manual ROI kept and emphasized (recommended). Use the button "Afficher ROI & Sélection manuelle".
+   - Automatic ROI:
+       i) advance from the beginning until the angular velocity reaches the **active-mean** (within ±tol%)
+      ii) recede from the end until the angular velocity reaches the **active-mean** (within ±tol%)
+      → ROI = [first_hit_from_start, last_hit_from_end]. Non-zero detection still by threshold (deg/s).
+2) Adaptive variable list:
+   - The Y-variable list adapts to the chosen X-axis type:
+       * Time/CrankAngle/CrankAngle360°/Polar: numeric columns from the trimmed dataframe.
+       * CycleIndex: cycle-level metrics only (from cycle_summary).
+   - For CycleIndex plotting, different markers are used per variable for clarity.
+3) Legends:
+   - All plotting modes now include legends with one label per Y-variable/series.
 """
 
 from __future__ import annotations
@@ -36,10 +37,6 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import SpanSelector
 
-
-# ------------------------------
-# Configuration & Column Names
-# ------------------------------
 
 INTENDED_HEADERS = [
     "Time",
@@ -114,17 +111,12 @@ def read_lvm(filepath, intended_headers=INTENDED_HEADERS, encoding='utf-8'):
     return df
 
 
-# ------------------------------
-# Core Analysis
-# ------------------------------
-
 class ArmCrankAnalyzer:
     def __init__(self, df: pd.DataFrame):
         self.df_raw = df.copy()
         self.df = df
         self.sampling_hz = None
 
-        # Try to locate columns (accept slight variations / duplicates)
         self.col_time = self._find_first_col(["Time", "Time_2", "time", "time_2"])
         self.col_crank_ang = self._find_first_col(["Crank Angular position", "Crank Angular position_2", "Crank angle"])
         self.col_ang_vel = self._find_first_col(["Angular velocity", "Angular velocity_2", "Crank angular velocity"])
@@ -154,7 +146,6 @@ class ArmCrankAnalyzer:
         self.col_work_R = self._find_first_col(["Right pedal Work"])
         self.col_work_T = self._find_first_col(["Total Work"])
 
-        # Derived column names
         self.col_crank_rad = "Crank angle [rad]"
         self.col_crank_rad_unwrapped = "Crank angle unwrapped [rad]"
         self.col_ang_vel_from_unwrap = "Angular velocity from unwrapped [rad/s]"
@@ -164,9 +155,7 @@ class ArmCrankAnalyzer:
         self.col_left_Fnorm_crank = "Left pedal |F| (crank)"
         self.col_right_Fnorm_crank = "Right pedal |F| (crank)"
 
-        # Results
         self.trim_start_idx = None
-        my = None
         self.trim_end_idx = None
         self.df_trim = None
         self.cycles = []
@@ -176,7 +165,6 @@ class ArmCrankAnalyzer:
         self.stats_angle_mean = None
         self.stats_angle_std = None
 
-        # Cache for ROI viz
         self._roi_cache = None
 
     def _find_first_col(self, candidates):
@@ -218,7 +206,6 @@ class ArmCrankAnalyzer:
 
         if verbose: print("[10/11] Done.")
 
-    # ----- Step 1: Sampling -----
     def compute_sampling_hz(self):
         if self.col_time is None:
             raise ValueError("No 'Time' column found.")
@@ -229,7 +216,6 @@ class ArmCrankAnalyzer:
             raise ValueError("Time column has non-increasing or invalid values.")
         self.sampling_hz = 1.0 / float(np.mean(dt))
 
-    # ----- Step 2: Trim to steady (auto) -----
     def trim_to_steady_speed(self, tol_ratio=0.05, non_zero_thr_deg_s=2.0, min_steady_seconds=1.0):
         if self.col_ang_vel is None or self.col_ang_vel not in self.df.columns:
             self.trim_start_idx = 0
@@ -243,52 +229,59 @@ class ArmCrankAnalyzer:
             self.df_trim = self.df.copy()
             return
 
-        # Active mask: |w| > threshold (deg/s → rad/s)
         thr = np.deg2rad(non_zero_thr_deg_s)
         active_mask = np.isfinite(w_full) & (np.abs(w_full) > thr)
 
         mu_active = np.nanmean(w_full[active_mask]) if active_mask.any() else np.nanmean(w_full)
         tol = abs(mu_active) * tol_ratio if np.isfinite(mu_active) else 0.0
-        mask = np.isfinite(w_full) & (np.abs(w_full - mu_active) <= tol)
 
-        # Longest contiguous True segment
-        best_len = 0
-        best_start = 0
-        cur_len = 0
-        cur_start = 0
-        for i, ok in enumerate(mask):
-            if ok:
-                if cur_len == 0:
-                    cur_start = i
-                cur_len += 1
-            else:
-                if cur_len > best_len:
-                    best_len = cur_len
-                    best_start = cur_start
-                cur_len = 0
-        if cur_len > best_len:
-            best_len = cur_len
-            best_start = cur_start
+        i0 = 0
+        while i0 < len(w_full) and not (np.isfinite(w_full[i0]) and abs(w_full[i0] - mu_active) <= tol):
+            i0 += 1
+
+        i1 = len(w_full) - 1
+        while i1 >= 0 and not (np.isfinite(w_full[i1]) and abs(w_full[i1] - mu_active) <= tol):
+            i1 -= 1
+
+        if i0 >= i1:
+            i0, i1 = 0, len(w_full) - 1
 
         if self.sampling_hz is None:
             self.compute_sampling_hz()
         min_len = int(max(1, min_steady_seconds * self.sampling_hz))
-        if best_len >= min_len:
-            self.trim_start_idx = best_start
-            self.trim_end_idx = best_start + best_len - 1
-        else:
-            self.trim_start_idx = 0
-            self.trim_end_idx = len(self.df) - 1
+        if (i1 - i0 + 1) < min_len:
+            i0, i1 = 0, len(w_full) - 1
 
-        self.df_trim = self.df.iloc[self.trim_start_idx:self.trim_end_idx + 1].reset_index(drop=True)
+        self.trim_start_idx = i0
+        self.trim_end_idx = i1
+        self.df_trim = self.df.iloc[i0:i1 + 1].reset_index(drop=True)
 
-        # Cache for ROI viz
         t = self.df[self.col_time].to_numpy(dtype=float)
         self._roi_cache = dict(t=t, w=w_full, active_mask=active_mask, mu_active=mu_active,
-                               mask=mask, idx0=self.trim_start_idx, idx1=self.trim_end_idx,
-                               thr_deg_s=non_zero_thr_deg_s, tol_ratio=tol_ratio)
+                               idx0=i0, idx1=i1, thr_deg_s=non_zero_thr_deg_s, tol_ratio=tol_ratio)
 
-    # ----- Step 3: Angle to radians -----
+    def set_manual_trim(self, t_start: float, t_end: float):
+        if self.col_time is None:
+            raise ValueError("No 'Time' column found.")
+        t = self.df[self.col_time].to_numpy(dtype=float)
+        if t_end <= t_start:
+            raise ValueError("t_end must be > t_start.")
+        i0 = int(np.searchsorted(t, t_start, side='left'))
+        i1 = int(np.searchsorted(t, t_end, side='right')) - 1
+        i0 = max(0, min(i0, len(self.df) - 1))
+        i1 = max(0, min(i1, len(self.df) - 1))
+        if i1 <= i0:
+            raise ValueError("Selected ROI too short or invalid indices.")
+        self.trim_start_idx = i0
+        self.trim_end_idx = i1
+        self.df_trim = self.df.iloc[i0:i1 + 1].reset_index(drop=True)
+        self.cycles = []
+        self.cycle_summary = None
+        self.stats_mean = None
+        self.stats_std = None
+        self.stats_angle_mean = None
+        self.stats_angle_std = None
+
     def add_crank_angle_radians(self):
         if self.col_crank_ang is None:
             raise ValueError("No 'Crank Angular position' column found.")
@@ -297,7 +290,6 @@ class ArmCrankAnalyzer:
         ang_rad = np.deg2rad(ang) if amax > 6.5 else ang
         self.df_trim[self.col_crank_rad] = ang_rad
 
-    # ----- Step 4: Unwrap & ang vel -----
     def unwrap_and_compute_ang_vel(self, sg_window=None, sg_poly=3):
         t = self.df_trim[self.col_time].to_numpy(dtype=float)
         ang = self.df_trim[self.col_crank_rad].to_numpy(dtype=float)
@@ -308,7 +300,6 @@ class ArmCrankAnalyzer:
             w = np.gradient(ang_u) / dt
         self.df_trim[self.col_ang_vel_from_unwrap] = w
 
-    # ----- Step 5: Force norms -----
     def compute_force_norms(self):
         def norm3(cols):
             if None in cols:
@@ -324,7 +315,6 @@ class ArmCrankAnalyzer:
         if None not in self.cols_right_F_crank:
             self.df_trim[self.col_right_Fnorm_crank] = norm3(self.cols_right_F_crank)
 
-    # ----- Step 6: Cycle detection -----
     def detect_cycles_from_unwrap(self):
         ang_u = self.df_trim[self.col_crank_rad_unwrapped].to_numpy(dtype=float)
         k = np.floor(ang_u / (2 * np.pi)).astype(int)
@@ -334,7 +324,6 @@ class ArmCrankAnalyzer:
         min_len = int(max(3, (self.sampling_hz or 100) * 0.2))
         self.cycles = [(int(s), int(e)) for s, e in zip(starts, ends) if (e - s + 1) >= min_len]
 
-    # ----- Step 7: Time-normalized stats -----
     def compute_cycle_stats(self, n_points=100):
         if not self.cycles:
             self.stats_mean = pd.DataFrame()
@@ -365,7 +354,6 @@ class ArmCrankAnalyzer:
         self.stats_mean = pd.DataFrame(mean_data, index=(xn * 100.0))
         self.stats_std = pd.DataFrame(std_data, index=(xn * 100.0))
 
-    # ----- Step 8: Angle-normalized stats (0..360°) -----
     def compute_angle_stats(self, n_degrees=360):
         if not self.cycles:
             self.stats_angle_mean = pd.DataFrame()
@@ -394,7 +382,6 @@ class ArmCrankAnalyzer:
         self.stats_angle_mean = pd.DataFrame(mean_data, index=np.arange(n_degrees))
         self.stats_angle_std  = pd.DataFrame(std_data, index=np.arange(n_degrees))
 
-    # ----- Step 9: Per-cycle metrics -----
     def compute_per_cycle_metrics(self):
         rows = []
         for idx, (s, e) in enumerate(self.cycles):
@@ -463,9 +450,14 @@ class ArmCrankAnalyzer:
             })
         self.cycle_summary = pd.DataFrame(rows)
 
-    # ----- Plotting -----
     def list_numeric_columns(self):
         return [c for c in self.df_trim.columns if pd.api.types.is_numeric_dtype(self.df_trim[c])]
+
+    def list_cycle_metrics(self):
+        if self.cycle_summary is None or self.cycle_summary.empty:
+            return []
+        exclude = {"cycle_index", "start_idx", "end_idx"}
+        return [c for c in self.cycle_summary.columns if c not in exclude]
 
     def plot(self, figure_type="XY", x_axis="Time", y_vars=None, show_all_cycles=False, show_mean_std=True):
         if not y_vars:
@@ -475,28 +467,28 @@ class ArmCrankAnalyzer:
         if x_axis not in ("Time", "NormalizedCycle%", "CrankAngle", "CrankAngle360°", "CycleIndex"):
             raise ValueError("x_axis must be one of: Time, NormalizedCycle%, CrankAngle, CrankAngle360°, CycleIndex.")
 
-        # Polar plot
         if figure_type == "Polar":
             theta = self.df_trim[self.col_crank_rad].to_numpy(dtype=float)
             fig = plt.figure()
             ax = fig.add_subplot(111, projection='polar')
             for y in y_vars:
                 r = self.df_trim[y].to_numpy(dtype=float)
-                ax.plot(theta, r, linewidth=1.2)
+                ax.plot(theta, r, linewidth=1.2, label=y)
             ax.set_title("Polar plot vs crank angle (rad)")
+            ax.legend()
             plt.show()
             return
 
-        # XY
         if x_axis == "Time":
             x = self.df_trim[self.col_time].to_numpy(dtype=float)
             fig, ax = plt.subplots()
             for y in y_vars:
-                ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2)
+                ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2, label=y)
             ax.set_xlabel("Time [s]")
             ax.set_ylabel(", ".join(y_vars))
             ax.set_title("Time-series")
             ax.grid(True, which='both', alpha=0.3)
+            ax.legend()
             plt.show()
             return
 
@@ -504,11 +496,12 @@ class ArmCrankAnalyzer:
             x = np.rad2deg(self.df_trim[self.col_crank_rad].to_numpy(dtype=float))
             fig, ax = plt.subplots()
             for y in y_vars:
-                ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2)
+                ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2, label=y)
             ax.set_xlabel("Crank angle [deg]")
             ax.set_ylabel(", ".join(y_vars))
             ax.set_title("Signals vs crank angle (degrees)")
             ax.grid(True, which='both', alpha=0.3)
+            ax.legend()
             plt.show()
             return
 
@@ -526,17 +519,18 @@ class ArmCrankAnalyzer:
                     for y in y_vars:
                         yv = seg[y].to_numpy(dtype=float)
                         y_interp = np.interp(grid_rad, ang_mod, yv, left=np.nan, right=np.nan)
-                        ax.plot(degs, y_interp, alpha=0.2, linewidth=0.8)
+                        ax.plot(degs, y_interp, alpha=0.2, linewidth=0.8, label=None)
             if show_mean_std:
                 for y in y_vars:
                     mu = self.stats_angle_mean[y].to_numpy(dtype=float)
                     sd = self.stats_angle_std[y].to_numpy(dtype=float)
-                    ax.plot(degs, mu, linewidth=2.0)
-                    ax.fill_between(degs, mu - sd, mu + sd, alpha=0.2)
+                    ax.plot(degs, mu, linewidth=2.0, label=f"{y} (mean)")
+                    ax.fill_between(degs, mu - sd, mu + sd, alpha=0.2, label=f"{y} (±1 SD)")
             ax.set_xlabel("Crank angle [deg]")
             ax.set_ylabel(", ".join(y_vars))
             ax.set_title("Angle-normalized (0–360°)")
             ax.grid(True, which='both', alpha=0.3)
+            ax.legend()
             plt.show()
             return
 
@@ -545,18 +539,20 @@ class ArmCrankAnalyzer:
                 raise RuntimeError("No cycle_summary available. Run compute_per_cycle_metrics() first.")
             x = self.cycle_summary["cycle_index"].to_numpy(dtype=float)
             fig, ax = plt.subplots()
-            for y in y_vars:
+            markers = ['o', 's', '^', 'D', 'v', '>', '<', 'p', '*', 'h', 'X']
+            for i, y in enumerate(y_vars):
                 if y not in self.cycle_summary.columns:
                     raise ValueError(f"'{y}' is not a cycle-level metric.")
-                ax.plot(x, self.cycle_summary[y].to_numpy(dtype=float), marker='o', linewidth=1.2)
+                m = markers[i % len(markers)]
+                ax.plot(x, self.cycle_summary[y].to_numpy(dtype=float), marker=m, linewidth=1.2, label=y)
             ax.set_xlabel("Cycle index")
             ax.set_ylabel(", ".join(y_vars))
             ax.set_title("Cycle-level metrics")
             ax.grid(True, which='both', alpha=0.3)
+            ax.legend()
             plt.show()
             return
 
-    # ----- ROI Visualization -----
     def show_roi_figure(self):
         if not self._roi_cache:
             raise RuntimeError("Run trim_to_steady_speed() first.")
@@ -569,11 +565,10 @@ class ArmCrankAnalyzer:
         thr_deg_s = self._roi_cache["thr_deg_s"]
         tol_ratio = self._roi_cache["tol_ratio"]
         t0, t1 = t[idx0], t[idx1]
-
         fig, ax = plt.subplots()
         ax.plot(t, w, label="Angular velocity [rad/s]", linewidth=1.2)
         ax.plot(t[active], w[active], '.', alpha=0.3, label=f"Active (|w|>{thr_deg_s:.1f}°/s)")
-        ax.axhline(mu, color='k', linestyle='--', alpha=0.6, label=f"mean active = {mu:.3f} rad/s")
+        ax.axhline(mu, color='k', linestyle='--', alpha=0.7, label=f"mean active = {mu:.3f} rad/s")
         ax.axvspan(t0, t1, color='orange', alpha=0.2, label=f"Auto ROI (±{tol_ratio*100:.1f}%)")
         ax.set_xlabel("Time [s]")
         ax.set_ylabel("Angular velocity [rad/s]")
@@ -583,53 +578,42 @@ class ArmCrankAnalyzer:
         return fig, ax
 
 
-# ------------------------------
-# Tkinter GUI
-# ------------------------------
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Arm-Crank Analysis")
-        self.geometry("920x720")
+        self.geometry("980x760")
 
         self.filepath = tk.StringVar(value="")
         self.analyzer = None
 
-        # 1) File chooser
         frm_file = ttk.LabelFrame(self, text="1) Data file (.lvm)")
         frm_file.pack(fill="x", padx=10, pady=8)
         ttk.Entry(frm_file, textvariable=self.filepath).pack(side="left", fill="x", expand=True, padx=6, pady=6)
         ttk.Button(frm_file, text="Browse...", command=self.browse_file).pack(side="left", padx=6, pady=6)
 
-        # 2) Analysis parameters (sliders)
         frm_params = ttk.LabelFrame(self, text="2) Parameters (ROI detection)")
         frm_params.pack(fill="x", padx=10, pady=8)
 
-        self.tol_pct = tk.DoubleVar(value=5.0)         # ±%
-        self.nonzero_thr_deg = tk.DoubleVar(value=2.0)  # deg/s
+        self.tol_pct = tk.DoubleVar(value=5.0)
+        self.nonzero_thr_deg = tk.DoubleVar(value=2.0)
 
-        # Tolerance slider
         ttk.Label(frm_params, text="Tolerance around mean (±%)").grid(row=0, column=0, sticky="w", padx=6)
         tol_slider = tk.Scale(frm_params, from_=0.5, to=20.0, resolution=0.5, orient="horizontal",
                               variable=self.tol_pct, length=260)
         tol_slider.grid(row=0, column=1, sticky="we", padx=6)
 
-        # Threshold slider
         ttk.Label(frm_params, text="Non-zero speed threshold (deg/s)").grid(row=1, column=0, sticky="w", padx=6)
         thr_slider = tk.Scale(frm_params, from_=0.0, to=50.0, resolution=0.1, orient="horizontal",
                               variable=self.nonzero_thr_deg, length=260)
         thr_slider.grid(row=1, column=1, sticky="we", padx=6)
 
-        # Minimal steady duration
         self.minsec_var = tk.DoubleVar(value=1.0)
         ttk.Label(frm_params, text="Min steady segment (s)").grid(row=2, column=0, sticky="w", padx=6)
         ttk.Entry(frm_params, width=8, textvariable=self.minsec_var).grid(row=2, column=1, sticky="w", padx=6)
 
-        # Run button
         ttk.Button(frm_params, text="Run Pipeline", command=self.run_pipeline).grid(row=0, column=2, rowspan=3, padx=10, pady=4, sticky="ns")
 
-        # 3) Plotting
         frm_plot = ttk.LabelFrame(self, text="3) Plotting")
         frm_plot.pack(fill="both", expand=True, padx=10, pady=8)
 
@@ -639,8 +623,10 @@ class App(tk.Tk):
 
         self.x_axis = tk.StringVar(value="Time")
         ttk.Label(frm_plot, text="X axis:").grid(row=0, column=2, sticky="w", padx=6, pady=4)
-        ttk.Combobox(frm_plot, values=["Time", "NormalizedCycle%", "CrankAngle", "CrankAngle360°", "CycleIndex"],
-                     textvariable=self.x_axis, width=18).grid(row=0, column=3, sticky="w")
+        self.cmb_xaxis = ttk.Combobox(frm_plot, values=["Time", "NormalizedCycle%", "CrankAngle", "CrankAngle360°", "CycleIndex"],
+                                      textvariable=self.x_axis, width=18)
+        self.cmb_xaxis.grid(row=0, column=3, sticky="w")
+        self.cmb_xaxis.bind("<<ComboboxSelected>>", self._on_xaxis_changed)
 
         self.chk_all_cycles = tk.BooleanVar(value=False)
         self.chk_mean_std = tk.BooleanVar(value=True)
@@ -657,7 +643,6 @@ class App(tk.Tk):
         ttk.Button(frm_plot, text="Export cycle_summary.csv", command=self.export_cycle_summary).grid(row=4, column=2, sticky="e", padx=6, pady=6)
         ttk.Button(frm_plot, text="Export normalized_stats.csv", command=self.export_normalized_stats).grid(row=4, column=3, sticky="e", padx=6, pady=6)
 
-        # 4) ROI controls
         frm_roi = ttk.LabelFrame(self, text="4) ROI (Region Of Interest)")
         frm_roi.pack(fill="x", padx=10, pady=8)
         ttk.Button(frm_roi, text="Afficher ROI & Sélection manuelle", command=self.show_and_select_roi).pack(side="left", padx=6, pady=6)
@@ -690,19 +675,28 @@ class App(tk.Tk):
             )
             self.analyzer = ana
             self._refresh_y_list()
-            msg = (f"Sampling: {ana.sampling_hz:.2f} Hz | Steady segment: "
+            msg = (f"Sampling: {ana.sampling_hz:.2f} Hz | Auto ROI (new logic): "
                    f"[{ana.trim_start_idx}, {ana.trim_end_idx}] | Cycles: {len(ana.cycles)} | "
                    f"thr={self.nonzero_thr_deg.get():.1f}°/s, tol=±{self.tol_pct.get():.1f}%")
             self.status.set(msg)
-            messagebox.showinfo("Pipeline complete", msg)
+            messagebox.showinfo("Pipeline complete", msg + "\nAstuce: utilisez la sélection manuelle pour un contrôle précis.")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
     def _refresh_y_list(self):
         self.lst_y.delete(0, tk.END)
-        if self.analyzer is not None:
+        if self.analyzer is None:
+            return
+        xa = self.x_axis.get()
+        if xa == "CycleIndex":
+            for c in self.analyzer.list_cycle_metrics():
+                self.lst_y.insert(tk.END, c)
+        else:
             for c in self.analyzer.list_numeric_columns():
                 self.lst_y.insert(tk.END, c)
+
+    def _on_xaxis_changed(self, event):
+        self._refresh_y_list()
 
     def selected_y_vars(self):
         idxs = self.lst_y.curselection()
@@ -759,7 +753,6 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Save error", str(e))
 
-    # ----- ROI selection -----
     def show_and_select_roi(self):
         if self.analyzer is None:
             messagebox.showerror("Error", "Run the pipeline first.")
@@ -787,7 +780,6 @@ class App(tk.Tk):
         try:
             t0, t1 = self._manual_roi
             self.analyzer.set_manual_trim(t0, t1)
-            # Recompute downstream
             self.analyzer.add_crank_angle_radians()
             self.analyzer.unwrap_and_compute_ang_vel()
             self.analyzer.compute_force_norms()
@@ -796,7 +788,7 @@ class App(tk.Tk):
             self.analyzer.compute_angle_stats(n_degrees=360)
             self.analyzer.compute_per_cycle_metrics()
             self._refresh_y_list()
-            msg = (f"Manual ROI applied | Steady segment: "
+            msg = (f"Manual ROI applied | Segment: "
                    f"[{self.analyzer.trim_start_idx}, {self.analyzer.trim_end_idx}] | Cycles: {len(self.analyzer.cycles)}")
             self.status.set(msg)
             messagebox.showinfo("ROI applied", msg)
@@ -804,17 +796,12 @@ class App(tk.Tk):
             messagebox.showerror("ROI apply error", str(e))
 
 
-# ------------------------------
-# CLI Entrypoint
-# ------------------------------
-
 def main():
     if len(sys.argv) > 1:
         path = sys.argv[1]
         print(f"Loading: {path}")
         df = read_lvm(path)
         ana = ArmCrankAnalyzer(df)
-        # Defaults align with GUI defaults
         ana.run_full_pipeline(steady_tol_ratio=0.05, non_zero_thr_deg_s=2.0, verbose=True)
 
         base_no_ext, _ = os.path.splitext(path)
