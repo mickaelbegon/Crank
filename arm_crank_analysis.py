@@ -1,15 +1,22 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.4
+Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.5
 =================================================
 
-Changes in v1.4
----------------
-- UI: when X axis = "Time", the checkboxes **Show all cycles** and **Show mean ± std**
-  are disabled (they don't apply to raw time plots).
-- Plotting: when **Show all cycles** is enabled (for "CrankAngle360°"), all cycles
-  are drawn using a gradient of the **same base color** as the corresponding mean curve.
+What’s new in v1.5
+------------------
+- **Phase shift controls (+180°)**: two independent options to shift the angular
+  reference of **Left** variables and/or **Right** variables by +180° (π rad).
+  Applies to angle-domain plots only (Polar, CrankAngle, CrankAngle360°).
+- **Polar plot**: 0° is now at the **top** (North).
+
+Notes
+-----
+- The phase shift does not modify the raw data — only the plotting reference.
+- "Left variables" are detected by names starting with "Left " or "Left pedal".
+  Similarly for "Right " / "Right pedal".
 """
 
 from __future__ import annotations
@@ -472,8 +479,21 @@ class ArmCrankAnalyzer:
         exclude = {"cycle_index", "start_idx", "end_idx"}
         return [c for c in self.cycle_summary.columns if c not in exclude]
 
+    # ----- Utility: decide if variable is Left/Right -----
+    @staticmethod
+    def _is_left_var(name: str) -> bool:
+        s = name.lower()
+        return s.startswith("left ") or s.startswith("left pedal")
+
+    @staticmethod
+    def _is_right_var(name: str) -> bool:
+        s = name.lower()
+        return s.startswith("right ") or s.startswith("right pedal")
+
     # ----- Plotting -----
-    def plot(self, figure_type="XY", x_axis="Time", y_vars=None, show_all_cycles=False, show_mean_std=True):
+    def plot(self, figure_type="XY", x_axis="Time", y_vars=None,
+             show_all_cycles=False, show_mean_std=True,
+             shift_left_180=False, shift_right_180=False):
         if not y_vars:
             raise ValueError("Please specify at least one y variable to plot.")
         if figure_type not in ("XY", "Polar"):
@@ -483,13 +503,20 @@ class ArmCrankAnalyzer:
 
         # --- Polar plot (theta in radians) ---
         if figure_type == "Polar":
-            theta = self.df_trim[self.col_crank_rad].to_numpy(dtype=float)
+            base_theta = self.df_trim[self.col_crank_rad].to_numpy(dtype=float)
             fig = plt.figure()
             ax = fig.add_subplot(111, projection='polar')
+            # 0° at the top (North)
+            ax.set_theta_zero_location('N')
             for y in y_vars:
+                theta = base_theta.copy()
+                if self._is_left_var(y) and shift_left_180:
+                    theta = (theta + np.pi) % (2*np.pi)
+                if self._is_right_var(y) and shift_right_180:
+                    theta = (theta + np.pi) % (2*np.pi)
                 r = self.df_trim[y].to_numpy(dtype=float)
                 ax.plot(theta, r, linewidth=1.2, label=y)
-            ax.set_title("Polar plot vs crank angle (rad)")
+            ax.set_title("Polar plot vs crank angle (0° at North)")
             ax.legend()
             plt.show()
             return
@@ -510,9 +537,14 @@ class ArmCrankAnalyzer:
 
         # --- XY CrankAngle (in DEGREES) ---
         if x_axis == "CrankAngle":
-            x = np.rad2deg(self.df_trim[self.col_crank_rad].to_numpy(dtype=float))
+            base_deg = np.rad2deg(self.df_trim[self.col_crank_rad].to_numpy(dtype=float))
             fig, ax = plt.subplots()
             for y in y_vars:
+                x = base_deg.copy()
+                if self._is_left_var(y) and shift_left_180:
+                    x = (x + 180.0) % 360.0
+                if self._is_right_var(y) and shift_right_180:
+                    x = (x + 180.0) % 360.0
                 ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2, label=y)
             ax.set_xlabel("Crank angle [deg]")
             ax.set_ylabel(", ".join(y_vars))
@@ -529,31 +561,41 @@ class ArmCrankAnalyzer:
             degs = self.stats_angle_mean.index.to_numpy(dtype=float)
             fig, ax = plt.subplots()
 
-            # Get a deterministic color list
-            base_colors = matplotlib.rcParams['axes.prop_cycle'].by_key().get('color', ['C0', 'C1', 'C2', 'C3', 'C4', 'C5'])
+            # Get deterministic color list
+            base_colors = matplotlib.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5'])
+
+            # Helper to shift deg grid for a given var
+            def maybe_shift_deg_grid(varname, grid_deg):
+                g = grid_deg.copy()
+                if self._is_left_var(varname) and shift_left_180:
+                    g = (g + 180.0) % 360.0
+                if self._is_right_var(varname) and shift_right_180:
+                    g = (g + 180.0) % 360.0
+                return g
 
             if show_all_cycles and self.cycles:
                 nC = len(self.cycles)
-                # Gradient alphas for cycles (same base color as mean curve)
                 grad_alphas = np.linspace(0.15, 0.6, max(nC, 2))
                 for yi, y in enumerate(y_vars):
                     base = base_colors[yi % len(base_colors)]
-                    grid_rad = np.deg2rad(degs)
                     for ci, (s, e) in enumerate(self.cycles):
                         seg = self.df_trim.iloc[s:e+1]
                         ang_u = seg[self.col_crank_rad_unwrapped].to_numpy(dtype=float)
                         ang_mod = (ang_u - ang_u[0]) % (2 * np.pi)
+                        grid_rad = np.deg2rad(degs)
                         yv = seg[y].to_numpy(dtype=float)
                         y_interp = np.interp(grid_rad, ang_mod, yv, left=np.nan, right=np.nan)
-                        ax.plot(degs, y_interp, linewidth=0.8, color=base, alpha=float(grad_alphas[ci]), label=None)
+                        gdeg = maybe_shift_deg_grid(y, degs)
+                        ax.plot(gdeg, y_interp, linewidth=0.8, color=base, alpha=float(grad_alphas[ci]), label=None)
 
             if show_mean_std:
                 for yi, y in enumerate(y_vars):
                     base = base_colors[yi % len(base_colors)]
                     mu = self.stats_angle_mean[y].to_numpy(dtype=float)
                     sd = self.stats_angle_std[y].to_numpy(dtype=float)
-                    ax.plot(degs, mu, linewidth=2.0, color=base, label=f"{y} (mean)")
-                    ax.fill_between(degs, mu - sd, mu + sd, alpha=0.18, color=base, label=f"{y} (±1 SD)")
+                    gdeg = maybe_shift_deg_grid(y, degs)
+                    ax.plot(gdeg, mu, linewidth=2.0, color=base, label=f"{y} (mean)")
+                    ax.fill_between(gdeg, mu - sd, mu + sd, alpha=0.18, color=base, label=f"{y} (±1 SD)")
 
             ax.set_xlabel("Crank angle [deg]")
             ax.set_ylabel(", ".join(y_vars))
@@ -617,7 +659,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Arm-Crank Analysis")
-        self.geometry("980x780")
+        self.geometry("1000x820")
 
         self.filepath = tk.StringVar(value="")
         self.analyzer = None
@@ -674,6 +716,12 @@ class App(tk.Tk):
         self.chk_all_cycles_btn.grid(row=1, column=0, sticky="w", padx=6)
         self.chk_mean_std_btn.grid(row=1, column=1, sticky="w", padx=6)
 
+        # Phase shift controls
+        self.shift_left_var = tk.BooleanVar(value=False)
+        self.shift_right_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_plot, text="Shift LEFT +180°", variable=self.shift_left_var).grid(row=1, column=2, sticky="w", padx=6)
+        ttk.Checkbutton(frm_plot, text="Shift RIGHT +180°", variable=self.shift_right_var).grid(row=1, column=3, sticky="w", padx=6)
+
         ttk.Label(frm_plot, text="Y variables (multi-select):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         self.lst_y = tk.Listbox(frm_plot, selectmode="extended", width=60, height=16, exportselection=False)
         self.lst_y.grid(row=3, column=0, columnspan=4, sticky="nsew", padx=6, pady=6)
@@ -701,14 +749,11 @@ class App(tk.Tk):
     def _apply_xaxis_dependent_states(self):
         xa = self.x_axis.get()
         if xa == "Time":
-            # Disable checkboxes
             self.chk_all_cycles_btn.state(["disabled"])
             self.chk_mean_std_btn.state(["disabled"])
         else:
-            # Enable checkboxes
             self.chk_all_cycles_btn.state(["!disabled"])
             self.chk_mean_std_btn.state(["!disabled"])
-        # Update Y list
         self._refresh_y_list()
 
     def _on_xaxis_changed(self, event):
@@ -774,7 +819,9 @@ class App(tk.Tk):
                 x_axis=self.x_axis.get(),
                 y_vars=y,
                 show_all_cycles=self.chk_all_cycles_var.get(),
-                show_mean_std=self.chk_mean_std_var.get()
+                show_mean_std=self.chk_mean_std_var.get(),
+                shift_left_180=self.shift_left_var.get(),
+                shift_right_180=self.shift_right_var.get()
             )
         except Exception as e:
             messagebox.showerror("Plot error", str(e))
