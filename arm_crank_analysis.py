@@ -1,22 +1,14 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.5
+Arm-Crank (Hand-Cycling) Analysis Toolkit — v1.6
 =================================================
 
-What’s new in v1.5
+What’s new in v1.6
 ------------------
-- **Phase shift controls (+180°)**: two independent options to shift the angular
-  reference of **Left** variables and/or **Right** variables by +180° (π rad).
-  Applies to angle-domain plots only (Polar, CrankAngle, CrankAngle360°).
-- **Polar plot**: 0° is now at the **top** (North).
-
-Notes
------
-- The phase shift does not modify the raw data — only the plotting reference.
-- "Left variables" are detected by names starting with "Left " or "Left pedal".
-  Similarly for "Right " / "Right pedal".
+- **Per-side phase shift pickers**: choose **0 / 90 / 180 / 270°** for LEFT and for RIGHT
+  (applies to Polar, CrankAngle, CrankAngle360° only).
+- **Polar direction**: polar plot runs **clockwise** (theta_direction = -1) with **0° at North**.
 """
 
 from __future__ import annotations
@@ -493,7 +485,7 @@ class ArmCrankAnalyzer:
     # ----- Plotting -----
     def plot(self, figure_type="XY", x_axis="Time", y_vars=None,
              show_all_cycles=False, show_mean_std=True,
-             shift_left_180=False, shift_right_180=False):
+             shift_left_deg=0, shift_right_deg=0):
         if not y_vars:
             raise ValueError("Please specify at least one y variable to plot.")
         if figure_type not in ("XY", "Polar"):
@@ -501,22 +493,27 @@ class ArmCrankAnalyzer:
         if x_axis not in ("Time", "NormalizedCycle%", "CrankAngle", "CrankAngle360°", "CycleIndex"):
             raise ValueError("x_axis must be one of: Time, NormalizedCycle%, CrankAngle, CrankAngle360°, CycleIndex.")
 
+        # Sanitize shifts
+        shift_left_deg  = float(shift_left_deg) % 360.0
+        shift_right_deg = float(shift_right_deg) % 360.0
+
         # --- Polar plot (theta in radians) ---
         if figure_type == "Polar":
             base_theta = self.df_trim[self.col_crank_rad].to_numpy(dtype=float)
             fig = plt.figure()
             ax = fig.add_subplot(111, projection='polar')
-            # 0° at the top (North)
+            # 0° at the top (North) and clockwise direction
             ax.set_theta_zero_location('N')
+            ax.set_theta_direction(-1)
             for y in y_vars:
                 theta = base_theta.copy()
-                if self._is_left_var(y) and shift_left_180:
-                    theta = (theta + np.pi) % (2*np.pi)
-                if self._is_right_var(y) and shift_right_180:
-                    theta = (theta + np.pi) % (2*np.pi)
+                if self._is_left_var(y):
+                    theta = (theta + np.deg2rad(shift_left_deg)) % (2*np.pi)
+                if self._is_right_var(y):
+                    theta = (theta + np.deg2rad(shift_right_deg)) % (2*np.pi)
                 r = self.df_trim[y].to_numpy(dtype=float)
                 ax.plot(theta, r, linewidth=1.2, label=y)
-            ax.set_title("Polar plot vs crank angle (0° at North)")
+            ax.set_title("Polar plot vs crank angle (CW, 0° at North)")
             ax.legend()
             plt.show()
             return
@@ -541,10 +538,10 @@ class ArmCrankAnalyzer:
             fig, ax = plt.subplots()
             for y in y_vars:
                 x = base_deg.copy()
-                if self._is_left_var(y) and shift_left_180:
-                    x = (x + 180.0) % 360.0
-                if self._is_right_var(y) and shift_right_180:
-                    x = (x + 180.0) % 360.0
+                if self._is_left_var(y):
+                    x = (x + shift_left_deg) % 360.0
+                if self._is_right_var(y):
+                    x = (x + shift_right_deg) % 360.0
                 ax.plot(x, self.df_trim[y].to_numpy(dtype=float), linewidth=1.2, label=y)
             ax.set_xlabel("Crank angle [deg]")
             ax.set_ylabel(", ".join(y_vars))
@@ -567,10 +564,10 @@ class ArmCrankAnalyzer:
             # Helper to shift deg grid for a given var
             def maybe_shift_deg_grid(varname, grid_deg):
                 g = grid_deg.copy()
-                if self._is_left_var(varname) and shift_left_180:
-                    g = (g + 180.0) % 360.0
-                if self._is_right_var(varname) and shift_right_180:
-                    g = (g + 180.0) % 360.0
+                if self._is_left_var(varname):
+                    g = (g + shift_left_deg) % 360.0
+                if self._is_right_var(varname):
+                    g = (g + shift_right_deg) % 360.0
                 return g
 
             if show_all_cycles and self.cycles:
@@ -659,7 +656,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Arm-Crank Analysis")
-        self.geometry("1000x820")
+        self.geometry("1040x840")
 
         self.filepath = tk.StringVar(value="")
         self.analyzer = None
@@ -716,21 +713,26 @@ class App(tk.Tk):
         self.chk_all_cycles_btn.grid(row=1, column=0, sticky="w", padx=6)
         self.chk_mean_std_btn.grid(row=1, column=1, sticky="w", padx=6)
 
-        # Phase shift controls
-        self.shift_left_var = tk.BooleanVar(value=False)
-        self.shift_right_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_plot, text="Shift LEFT +180°", variable=self.shift_left_var).grid(row=1, column=2, sticky="w", padx=6)
-        ttk.Checkbutton(frm_plot, text="Shift RIGHT +180°", variable=self.shift_right_var).grid(row=1, column=3, sticky="w", padx=6)
+        # Phase shift selectors (LEFT/RIGHT)
+        ttk.Label(frm_plot, text="Shift LEFT (deg):").grid(row=1, column=2, sticky="e", padx=6)
+        self.shift_left_sel = ttk.Combobox(frm_plot, values=["0","90","180","270"], width=6, state="readonly")
+        self.shift_left_sel.current(0)
+        self.shift_left_sel.grid(row=1, column=3, sticky="w", padx=2)
+
+        ttk.Label(frm_plot, text="Shift RIGHT (deg):").grid(row=1, column=4, sticky="e", padx=6)
+        self.shift_right_sel = ttk.Combobox(frm_plot, values=["0","90","180","270"], width=6, state="readonly")
+        self.shift_right_sel.current(0)
+        self.shift_right_sel.grid(row=1, column=5, sticky="w", padx=2)
 
         ttk.Label(frm_plot, text="Y variables (multi-select):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         self.lst_y = tk.Listbox(frm_plot, selectmode="extended", width=60, height=16, exportselection=False)
-        self.lst_y.grid(row=3, column=0, columnspan=4, sticky="nsew", padx=6, pady=6)
+        self.lst_y.grid(row=3, column=0, columnspan=6, sticky="nsew", padx=6, pady=6)
         frm_plot.grid_columnconfigure(0, weight=1)
         frm_plot.grid_rowconfigure(3, weight=1)
 
         ttk.Button(frm_plot, text="Plot", command=self.plot).grid(row=4, column=0, sticky="w", padx=6, pady=6)
-        ttk.Button(frm_plot, text="Export cycle_summary.csv", command=self.export_cycle_summary).grid(row=4, column=2, sticky="e", padx=6, pady=6)
-        ttk.Button(frm_plot, text="Export normalized_stats.csv", command=self.export_normalized_stats).grid(row=4, column=3, sticky="e", padx=6, pady=6)
+        ttk.Button(frm_plot, text="Export cycle_summary.csv", command=self.export_cycle_summary).grid(row=4, column=4, sticky="e", padx=6, pady=6)
+        ttk.Button(frm_plot, text="Export normalized_stats.csv", command=self.export_normalized_stats).grid(row=4, column=5, sticky="e", padx=6, pady=6)
 
         # 4) ROI controls
         frm_roi = ttk.LabelFrame(self, text="4) ROI (Region Of Interest)")
@@ -814,14 +816,16 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Select at least one Y variable.")
             return
         try:
+            shift_left  = float(self.shift_left_sel.get())
+            shift_right = float(self.shift_right_sel.get())
             self.analyzer.plot(
                 figure_type=self.fig_type.get(),
                 x_axis=self.x_axis.get(),
                 y_vars=y,
                 show_all_cycles=self.chk_all_cycles_var.get(),
                 show_mean_std=self.chk_mean_std_var.get(),
-                shift_left_180=self.shift_left_var.get(),
-                shift_right_180=self.shift_right_var.get()
+                shift_left_deg=shift_left,
+                shift_right_deg=shift_right
             )
         except Exception as e:
             messagebox.showerror("Plot error", str(e))
